@@ -1,0 +1,15 @@
+download phoenix roms or read the proms from your arcade pcb.
+place it next to the py script in folder /rom
+
+You run the Python script once locally on your machine to generate the .c file, then commit that generated .c file into your project. The ROMs never go into the build — only the baked C array does.
+
+
+rom/                          <- NOT in git/build, stays local only
+  ic45
+  ic46
+  ...
+  mmi6301.ic40
+  mmi6301.ic41
+
+
+python make_embedded_roms.py rom/ src/phoenix_embedded_assets.c

@@ -1,0 +1,17 @@
+// ─────────────────────────────────────────────
+// Pin‑Belegung (gemäß wiring.txt)
+// ─────────────────────────────────────────────
+#define PIN_MOSI 5   // ILI9341 MOSI
+#define PIN_CLK  6   // ILI9341 SCK  
+#define PIN_CS   7   // ILI9341 CS
+#define PIN_DC    8   // ILI9341 DC
+#define PIN_RST   9   // ILI9341 RST
+#define PIN_BL   48   // Status LED (als Backup für BL)
+
+#define TFT_WIDTH   240
+#define TFT_HEIGHT  320
+#define CHUNK_LINES 32   // 32‑Zeilen‑DMA‑Chunk
+
+
+buttons gpio 10-15
+

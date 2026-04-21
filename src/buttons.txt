@@ -1,0 +1,8 @@
+#define BTN_RIGHT_PIN   10   // ✅ Frei
+#define BTN_LEFT_PIN     3   // ✅ Frei (war 11 = Flash-Pin, immer LOW!)
+#define BTN_UP_PIN      12   // ✅ Frei
+#define BTN_DOWN_PIN    14   // ✅ Frei (nicht 3!)
+#define BTN_A_PIN       15   // ✅ Frei
+#define BTN_B_PIN       16   // ✅ Frei
+#define BTN_SELECT_PIN  46   // ✅ Frei (war 17 = intern belegt, immer LOW!)
+#define BTN_START_PIN   18   // ✅ Frei
