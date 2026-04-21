@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <esp_log.h>
 #include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // LCD Driver
 #include "lcd_spi.h"
@@ -73,72 +75,48 @@ static const uint8_t* bg_tiles = phoenix_bg_tiles;
 static uint8_t vblank_flag = 0x80;  // Bit 7 of DIP register
 static uint32_t last_vblank_toggle = 0;
 
+// Precomputed vblank: toggled by cycle count, no micros() in hot loop
+static uint8_t  s_vblank_state  = 0x80;  // bit7: HIGH=active, LOW=blanking
+static uint32_t s_vblank_cycles = 0;     // unused, kept for reference
+
 extern "C" IRAM_ATTR byte RdZ80(uint16_t Addr) {
-    // Memory-mapped I/O reads
-    if (Addr >= 0x7000 && Addr < 0x7400) {
-        // Input 0: buttons (read at 0x7000-0x73FF)
-        return input_0;
-    } else if (Addr >= 0x7800 && Addr < 0x7C00) {
-        // DIP switches + VBLANK flag in bit 7 (read at 0x7800-0x7BFF)
-        // Z80 code at 0x0080 waits for:
-        //   1. bit 7 = 1 (not in vblank, active display)
-        //   2. then bit 7 = 0 (in vblank)
-        // Vblank timing: exact 60Hz = 16667us frame
-        // 1300us LOW (vblank), 15367us HIGH (active display)
-        static uint32_t last_toggle = 0;
-        static uint8_t vblank_state = 0x80;  // Start HIGH (active display)
-        static uint16_t high_duration = 15367;  // ~15.37ms HIGH
-        static uint16_t low_duration = 1300;    // ~1.3ms LOW
-        uint32_t now = micros();
-        uint16_t duration = (vblank_state & 0x80) ? high_duration : low_duration;
-        if (now - last_toggle >= duration) {
-            last_toggle = now;
-            vblank_state = (vblank_state & 0x80) ? 0x00 : 0x80;
-        }
-        return dip_sw | vblank_state;
-    } else if (Addr < 0x4000) {
-        // ROM
+    // ROM is ~80% of all reads (opcode fetch every instruction) -> check FIRST
+    if (Addr < 0x4000)
         return phoenix_prog_rom[Addr];
-    } else if (Addr >= 0x4000 && Addr < 0x5000) {
-        // Video RAM bank
+
+    // VRAM (video ops, moderate frequency)
+    if (Addr < 0x5000)
         return video_ram[bank_select][Addr - 0x4000];
-    } else if (Addr >= 0x6000 && Addr < 0x6400) {
-        // Sound A - write only, return 0
-        return 0x00;
-    } else if (Addr >= 0x6800 && Addr < 0x6C00) {
-        // Sound B - write only, return 0
-        return 0x00;
+
+    // DSW0 + VBlank bit7 (tight loop in WaitVBlankCoin)
+    // Use cycle counter instead of micros() - no system call overhead
+    if (Addr < 0x7C00) {
+        if (Addr >= 0x7800)
+            return dip_sw | s_vblank_state;
+        // IN0 buttons (0x7000-0x73FF)
+        if (Addr >= 0x7000)
+            return input_0;
     }
-    // Unmapped - return 0x00 (NOP) to prevent garbage execution
     return 0x00;
 }
 
 extern "C" IRAM_ATTR void WrZ80(uint16_t Addr, byte Value) {
-    // Memory-mapped I/O writes
+    // VRAM is most frequent write (tile updates every frame)
+    if (Addr >= 0x4000 && Addr < 0x5000) {
+        video_ram[bank_select][Addr - 0x4000] = Value;
+        return;
+    }
     if (Addr >= 0x5000 && Addr < 0x5400) {
-        // Video register - bank select (write at 0x5000-0x53FF)
         video_reg = Value;
         bank_select = Value & 0x01;
     } else if (Addr >= 0x5800 && Addr < 0x5C00) {
-        // Scroll register (write at 0x5800-0x5BFF)
         scroll_reg = Value;
     } else if (Addr >= 0x6000 && Addr < 0x6400) {
-        // Sound A (write at 0x6000-0x63FF)
         sound_a = Value;
         phoenix_audio_control_a(Value);
     } else if (Addr >= 0x6800 && Addr < 0x6C00) {
-        // Sound B (write at 0x6800-0x6BFF)
         sound_b = Value;
         phoenix_audio_control_b(Value);
-    } else if (Addr >= 0x4000 && Addr < 0x5000) {
-        // Video RAM bank (0x4000-0x4FFF)
-        // Stack is at 0x4BF0-0x4BFF in bank 0
-        if (Addr >= 0x4BF0 && Addr <= 0x4BFF) {
-            // Stack area - valid
-            video_ram[bank_select][Addr - 0x4000] = Value;
-        } else {
-            video_ram[bank_select][Addr - 0x4000] = Value;
-        }
     }
 }
 
@@ -152,6 +130,20 @@ static IRAM_ATTR void render_screen();
 // === Z80 INTERRUPT HANDLING ===
 
 extern "C" IRAM_ATTR uint16_t LoopZ80(Z80 *R) {
+    // Original Phoenix: 8085 @ 2.75MHz, 60Hz = 45833 cycles/frame
+    // Phase 0: 40000 cycles active display (bit7=HIGH)
+    // Phase 1:  5833 cycles vblank        (bit7=LOW) -> then render
+    static uint8_t phase = 0;
+    if (phase == 0) {
+        s_vblank_state = 0x00;   // enter vblank
+        cpu.IPeriod = 5833;
+        phase = 1;
+        return INT_NONE;
+    }
+    s_vblank_state = 0x80;       // back to active display
+    cpu.IPeriod = 40000;
+    phase = 0;
+
     input_0 = phoenix_read_inputs();
     phoenix_audio_update();
     render_screen();
@@ -274,6 +266,10 @@ static IRAM_ATTR void render_tile_scrolled(uint16_t* fb,
     }
 }
 
+// Forward declaration — defined after setup()
+static TaskHandle_t s_spi_task_handle  = nullptr;
+static TaskHandle_t s_main_task_handle = nullptr;  // Core1 main task
+
 static IRAM_ATTR void render_screen() {
     uint16_t* fb = g_fb.begin_write();
     if (!fb) return;
@@ -307,7 +303,10 @@ static IRAM_ATTR void render_screen() {
     }
 
     g_fb.publish_write(VideoFramebuffer::kWidth, VideoFramebuffer::kHeight);
-    tft_send_frame(g_fb.front_buffer());
+    // Signal Core0 to send frame, then WAIT until it's done before returning.
+    // This prevents Core1 from overwriting the buffer while Core0 is sending it.
+    xTaskNotifyGive(s_spi_task_handle);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // wait for SPI done signal back
 }
 
 // === EMULATOR CONTROL ===
@@ -319,7 +318,8 @@ static void z80_reset() {
     // Call LoopZ80 every ~1000 cycles for vblank polling
     // IPeriod = voller Frame auf einmal: 88000 Zyklen @ 5.5MHz = ~16ms
     // LoopZ80 wird nur 1x pro Frame aufgerufen -> minimaler Overhead
-    cpu.IPeriod = 88000;
+    // cpu.IPeriod = 40000;  // active display phase (2.75MHz / 60Hz * 86%)
+    cpu.IPeriod = 46000;  // active display phase (2.75MHz / 60Hz * 86%)
     // Note: memset(0) sets IFF1=0, IFF2=0 (interrupts disabled)
     // Phoenix uses SEI/DI - no IRQ ever! It polls DIP bit 7 for vblank.
     // Initialize stack pointer to top of RAM (0x4BF8 as per ClearRAMBank)
@@ -332,6 +332,17 @@ static void z80_reset() {
 
 
 
+
+// === CORE SPLIT ===
+// Core 1: Z80 emulation + tile rendering (time critical)
+// Core 0: SPI frame transfer to LCD (runs in parallel with next frame render)
+static void spi_task(void*) {
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // wait for frame ready
+        tft_send_frame(g_fb.front_buffer());       // send to LCD
+        xTaskNotifyGive(s_main_task_handle);       // signal: done, Core1 can render next
+    }
+}
 
 // === ARDUINO SETUP/LOOP ===
 
@@ -365,6 +376,12 @@ void setup() {
     phoenix_audio_init();
     phoenix_input_init();
     phoenix_boot_sound();
+
+    // SPI transfer task on Core 0, Core 1 runs Z80+render
+    // Capture main task handle so spi_task can signal back
+    s_main_task_handle = xTaskGetCurrentTaskHandle();
+    xTaskCreatePinnedToCore(spi_task, "spi", 2048, nullptr, 10, &s_spi_task_handle, 0);
+
     z80_reset();
 }
 
